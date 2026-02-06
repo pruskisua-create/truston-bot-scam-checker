@@ -2,7 +2,6 @@ import json
 import csv
 import io
 import re
-import logging
 from datetime import datetime
 from aiogram import Router
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove, ContentType
@@ -17,7 +16,6 @@ from keyboards import get_admin_keyboard, get_main_keyboard, get_threat_level_ke
 from utils import format_user_info, is_admin
 
 router = Router()
-logger = logging.getLogger(__name__)
 
 
 # ============ СОСТОЯНИЯ ============
@@ -66,9 +64,8 @@ async def cmd_help(message: Message):
         f"• /batch_add - Массовая загрузка из файла (админы)\n"
         f"• /delete - Удалить запись (админы)\n"
         f"• /stats - Статистика\n"
-        f"• /help - Справка\n"
-        f"• /debug - Отладка базы (админы)\n\n"
-        f"<b>Форматы файлов для массовой загрузка:</b>\n"
+        f"• /help - Справка\n\n"
+        f"<b>Форматы файлов для массовой загрузки:</b>\n"
         f"• CSV: user_id,username,threat_level,reason,proof\n"
         f"• TXT: ID ЮЗЕРНЕЙМ УРОВЕНЬ \"ПРИЧИНА\" \"ДОКАЗАТЕЛЬСТВА\"\n"
         f"• Уровни: 1✅, 2⚠️, 3🚨\n"
@@ -78,48 +75,8 @@ async def cmd_help(message: Message):
     await message.answer(help_text, parse_mode="HTML")
 
 
-@router.message(Command("debug"))
-async def cmd_debug(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ У вас нет доступа.")
-        return
-
-    # Показываем статистику базы
-    all_records = db.get_all_scammers()
-
-    debug_text = f"🔧 <b>ОТЛАДКА БАЗЫ ДАННЫХ</b>\n\n"
-    debug_text += f"📊 Всего записей: <b>{len(all_records)}</b>\n\n"
-
-    debug_text += "<b>Последние 10 записей:</b>\n"
-    for i, (user_id, username, level, reason, date) in enumerate(all_records[:10], 1):
-        username_display = f"@{username}" if username else "нет"
-        date_short = date.split()[0] if date else "???"
-        debug_text += f"{i}. <code>{user_id}</code> ({username_display}) - уровень {level} - {date_short}\n"
-
-    # Проверяем поиск на примере
-    if all_records:
-        test_id = all_records[0][0]
-        test_username = all_records[0][1]
-
-        debug_text += f"\n<b>Тест поиска:</b>\n"
-
-        # Ищем по ID
-        result_by_id, found_by_id = db.find_user(test_id)
-        debug_text += f"• Поиск по ID <code>{test_id}</code>: "
-        debug_text += f"<b>{'НАЙДЕНО' if result_by_id else 'НЕ НАЙДЕНО'}</b>\n"
-
-        # Ищем по username если есть
-        if test_username:
-            result_by_username, found_by_username = db.find_user(test_username)
-            debug_text += f"• Поиск по @{test_username}: "
-            debug_text += f"<b>{'НАЙДЕНО' if result_by_username else 'НЕ НАЙДЕНО'}</b>\n"
-
-    await message.answer(debug_text, parse_mode="HTML")
-
-
 @router.message(Command("batch_add"))
 async def cmd_batch_add(message: Message, state: FSMContext):
-    """Обработчик команды /batch_add - ПРОСТОЙ И ПОНЯТНЫЙ"""
     if not is_admin(message.from_user.id):
         await message.answer("⛔ У вас нет доступа.", reply_markup=get_main_keyboard())
         return
@@ -292,7 +249,6 @@ def parse_csv_content(content):
 
 @router.message(BatchAddScammers.waiting_for_file)
 async def process_batch_file(message: Message, state: FSMContext):
-    """Обработчик файла для массовой загрузки"""
     if message.text and message.text.lower() == 'отмена':
         await state.clear()
         await message.answer("❌ Массовая загрузка отменена.", reply_markup=get_admin_keyboard())
@@ -408,20 +364,11 @@ async def process_batch_confirm_yes(callback: CallbackQuery, state: FSMContext):
 
     for i, data in enumerate(batch_data, 1):
         try:
-            # Логируем перед добавлением
-            logger.info(
-                f"📥 Импортируем запись {i}/{len(batch_data)}: ID={data['user_id']}, username='{data['username']}'")
-
             # Проверяем, существует ли уже пользователь
             existing_user, _ = db.find_user(data['user_id'])
 
-            # Также проверяем по username если он есть
-            if not existing_user and data['username']:
-                existing_user, _ = db.find_user(data['username'])
-
             if existing_user:
                 skipped_count += 1
-                logger.info(f"⏭️ Пропущено (уже в базе): ID={data['user_id']}")
             else:
                 # Добавляем пользователя
                 success = db.add_scammer(
@@ -437,17 +384,8 @@ async def process_batch_confirm_yes(callback: CallbackQuery, state: FSMContext):
                 if success:
                     added_count += 1
                     db.log_admin_action(callback.from_user.id, "batch_add", data['user_id'])
-                    logger.info(f"✅ Успешно добавлено: ID={data['user_id']}")
-
-                    # Сразу проверяем что запись добавилась
-                    check_user, _ = db.find_user(data['user_id'])
-                    if check_user:
-                        logger.info(f"✅ Проверка: запись {data['user_id']} найдена в базе после добавления")
-                    else:
-                        logger.error(f"❌ ОШИБКА: запись {data['user_id']} не найдена в базе после добавления!")
                 else:
                     error_count += 1
-                    logger.error(f"❌ Ошибка при добавлении: ID={data['user_id']}")
 
             # Обновляем прогресс каждые 10 записей
             if i % 10 == 0 or i == len(batch_data):
@@ -463,20 +401,7 @@ async def process_batch_confirm_yes(callback: CallbackQuery, state: FSMContext):
         except Exception as e:
             error_count += 1
             errors.append(f"Ошибка при импорте {data['user_id']}: {str(e)}")
-            logger.error(f"❌ Ошибка при импорте записи {data['user_id']}: {e}")
             continue
-
-    # Проверяем итоговое состояние базы
-    all_records = db.get_all_scammers()
-    logger.info(f"📊 После импорта в базе: {len(all_records)} записей")
-
-    # Проверяем добавленные записи
-    for data in batch_data[:min(10, len(batch_data))]:
-        check_result, _ = db.find_user(data['user_id'])
-        if check_result:
-            logger.info(f"✅ Проверка поиска: ID={data['user_id']} -> НАЙДЕН (username: {check_result[1]})")
-        else:
-            logger.error(f"❌ Проверка поиска: ID={data['user_id']} -> НЕ НАЙДЕН!")
 
     # Итоговое сообщение
     result_text = (
@@ -525,54 +450,6 @@ async def cmd_delete(message: Message, state: FSMContext):
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(DeleteScammer.waiting_for_user_id)
-
-
-@router.message(Command("add"))
-async def cmd_add(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ У вас нет доступа.", reply_markup=get_main_keyboard())
-        return
-
-    await state.clear()
-    await state.update_data(files=[])
-    await message.answer(
-        "📝 <b>Добавление новой записи</b>\n\n"
-        "<b>ШАГ 1:</b> Введите <b>ID пользователя</b> (только цифры):\n"
-        "<i>Пример: 123456789</i>",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await state.set_state(AddScammer.waiting_for_user_id)
-
-
-@router.message(Command("check"))
-async def cmd_check(message: Message):
-    await message.answer(
-        "Отправьте <b>ID</b> или <b>@username</b> пользователя для проверки:",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    all_scammers = db.get_all_scammers()
-    total = len(all_scammers)
-
-    verified = len([s for s in all_scammers if s[2] == 1])
-    suspicious = len([s for s in all_scammers if s[2] == 2])
-    scammers = len([s for s in all_scammers if s[2] == 3])
-
-    stats_text = (
-        f"📊 <b>Статистика базы {PROJECT_NAME}</b>\n\n"
-        f"• 📁 Всего записей: <b>{total}</b>\n"
-        f"• ✅ Проверенных: <b>{verified}</b>\n"
-        f"• ⚠️ Под подозрением: <b>{suspicious}</b>\n"
-        f"• 🚨 Мошенников: <b>{scammers}</b>\n\n"
-        f"<i>Данные обновляются в реальном времени</i>"
-    )
-
-    await message.answer(stats_text, parse_mode="HTML")
 
 
 # ============ ОБРАБОТКА УДАЛЕНИЯ ============
@@ -936,14 +813,6 @@ async def process_threat_level(callback: CallbackQuery, state: FSMContext):
             parse_mode="HTML"
         )
         db.log_admin_action(callback.from_user.id, "add", user_data['user_id'])
-
-        # Проверяем что запись действительно добавлена
-        check_result, _ = db.find_user(user_data['user_id'])
-        if check_result:
-            logger.info(f"✅ Проверка: запись {user_data['user_id']} успешно добавлена и найдена в базе")
-        else:
-            logger.error(f"❌ ОШИБКА: запись {user_data['user_id']} не найдена в базе после добавления!")
-
         await callback.message.answer("Что дальше?", reply_markup=get_admin_keyboard())
     else:
         await callback.message.edit_text("❌ Ошибка при сохранении", parse_mode="HTML")
@@ -970,32 +839,24 @@ async def send_files(bot, chat_id, files):
             else:
                 await bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
     except Exception as e:
-        logger.error(f"❌ Ошибка при отправке файлов: {e}")
+        print(f"Ошибка при отправке файлов: {e}")
         await bot.send_message(chat_id, f"⚠️ Не удалось отправить некоторые файлы: {str(e)}")
 
 
 # Обработчик для поиска (только когда не в состоянии)
 @router.message(StateFilter(default_state))
 async def process_search(message: Message):
-    """Обрабатывает поиск ТОЛЬКО когда пользователь НЕ в состоянии FSM"""
+    """Обрабатывает поиск только когда не в состоянии FSM"""
 
-    # Пропускаем если это команда
-    if message.text and message.text.startswith('/'):
-        return
-
-    # Пропускаем кнопки меню
+    # Пропускаем команды и кнопки (они уже обработаны другими хэндлерами)
     if message.text in ["🔍 Проверить пользователя", "❓ Справка", "📊 Статистика базы",
                         "📋 Все записи", "➕ Добавить запись", "🗑️ Удалить запись", "📁 Массовая загрузка"]:
         return
 
     user_input = message.text.strip()
-    if not user_input:
-        return
-
-    logger.info(f"🔍 Пользователь ищет: '{user_input}'")
 
     # Ищем пользователя
-    user_data, found_by = db.find_user(user_input)
+    user_data, found_by = db.find_user(user_input.replace('@', ''))
 
     if not user_data:
         response = f"🔍 <b>Поиск:</b> <code>{user_input}</code>\n\n❌ Не найден в базе.\n✅ Статус: чистый"
