@@ -1,0 +1,1018 @@
+import json
+import csv
+import io
+import re
+import logging
+from datetime import datetime
+from aiogram import Router
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove, ContentType
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup, default_state
+
+from config import THREAT_LEVELS, ADMIN_CONTACTS, PROJECT_NAME
+from database import db
+from keyboards import get_admin_keyboard, get_main_keyboard, get_threat_level_keyboard, get_delete_keyboard, \
+    get_cancel_keyboard, get_confirm_keyboard
+from utils import format_user_info, is_admin
+
+router = Router()
+logger = logging.getLogger(__name__)
+
+
+# ============ СОСТОЯНИЯ ============
+class AddScammer(StatesGroup):
+    waiting_for_user_id = State()
+    waiting_for_username = State()
+    waiting_for_reason = State()
+    waiting_for_proof = State()
+    waiting_for_files = State()
+    waiting_for_threat_level = State()
+
+
+class DeleteScammer(StatesGroup):
+    waiting_for_user_id = State()
+
+
+class BatchAddScammers(StatesGroup):
+    waiting_for_file = State()
+    waiting_for_confirmation = State()
+
+
+# ============ СТАРТ И КОМАНДЫ ============
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    welcome_text = (
+        f"🛡️ <b>Добро пожаловать в антискам базу проекта {PROJECT_NAME}</b>\n\n"
+        f"Я помогаю проверять пользователей на наличие жалоб.\n"
+        f"Отправьте мне <b>ID</b> или <b>@username</b> пользователя для проверки.\n\n"
+        f"Вы также можете использовать кнопки ниже:"
+    )
+
+    if is_admin(message.from_user.id):
+        await message.answer(welcome_text, reply_markup=get_admin_keyboard(), parse_mode="HTML")
+    else:
+        await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    help_text = (
+        f"🛡️ <b>Справка по базе {PROJECT_NAME}</b>\n\n"
+        f"<b>Основные команды:</b>\n"
+        f"• /start - Запустить бота\n"
+        f"• /check - Проверить пользователя\n"
+        f"• /add - Добавить запись (админы)\n"
+        f"• /batch_add - Массовая загрузка из файла (админы)\n"
+        f"• /delete - Удалить запись (админы)\n"
+        f"• /stats - Статистика\n"
+        f"• /help - Справка\n"
+        f"• /debug - Отладка базы (админы)\n\n"
+        f"<b>Форматы файлов для массовой загрузка:</b>\n"
+        f"• CSV: user_id,username,threat_level,reason,proof\n"
+        f"• TXT: ID ЮЗЕРНЕЙМ УРОВЕНЬ \"ПРИЧИНА\" \"ДОКАЗАТЕЛЬСТВА\"\n"
+        f"• Уровни: 1✅, 2⚠️, 3🚨\n"
+        f"• Пример TXT: 123456789 scammer1 3 \"Обманул\" \"скрины\"\n\n"
+        f"<b>По вопросам:</b>\n{ADMIN_CONTACTS}"
+    )
+    await message.answer(help_text, parse_mode="HTML")
+
+
+@router.message(Command("debug"))
+async def cmd_debug(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.")
+        return
+
+    # Показываем статистику базы
+    all_records = db.get_all_scammers()
+
+    debug_text = f"🔧 <b>ОТЛАДКА БАЗЫ ДАННЫХ</b>\n\n"
+    debug_text += f"📊 Всего записей: <b>{len(all_records)}</b>\n\n"
+
+    debug_text += "<b>Последние 10 записей:</b>\n"
+    for i, (user_id, username, level, reason, date) in enumerate(all_records[:10], 1):
+        username_display = f"@{username}" if username else "нет"
+        date_short = date.split()[0] if date else "???"
+        debug_text += f"{i}. <code>{user_id}</code> ({username_display}) - уровень {level} - {date_short}\n"
+
+    # Проверяем поиск на примере
+    if all_records:
+        test_id = all_records[0][0]
+        test_username = all_records[0][1]
+
+        debug_text += f"\n<b>Тест поиска:</b>\n"
+
+        # Ищем по ID
+        result_by_id, found_by_id = db.find_user(test_id)
+        debug_text += f"• Поиск по ID <code>{test_id}</code>: "
+        debug_text += f"<b>{'НАЙДЕНО' if result_by_id else 'НЕ НАЙДЕНО'}</b>\n"
+
+        # Ищем по username если есть
+        if test_username:
+            result_by_username, found_by_username = db.find_user(test_username)
+            debug_text += f"• Поиск по @{test_username}: "
+            debug_text += f"<b>{'НАЙДЕНО' if result_by_username else 'НЕ НАЙДЕНО'}</b>\n"
+
+    await message.answer(debug_text, parse_mode="HTML")
+
+
+@router.message(Command("batch_add"))
+async def cmd_batch_add(message: Message, state: FSMContext):
+    """Обработчик команды /batch_add - ПРОСТОЙ И ПОНЯТНЫЙ"""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.", reply_markup=get_main_keyboard())
+        return
+
+    await message.answer(
+        "📁 <b>Массовая загрузка записей из файла</b>\n\n"
+        "Отправьте мне файл в формате CSV или TXT\n\n"
+        "<b>Формат CSV:</b>\n"
+        "<code>user_id,username,threat_level,reason,proof</code>\n\n"
+        "<b>Формат TXT:</b>\n"
+        "<code>123456789 scammer1 3 \"Обманул на 1000$\" \"скрины\"</code>\n\n"
+        "<b>Примечания:</b>\n"
+        "• threat_level: 1✅, 2⚠️, 3🚨\n"
+        "• username можно оставить пустым (используйте -)\n"
+        "• Для отмены напишите 'отмена'",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(BatchAddScammers.waiting_for_file)
+
+
+def parse_txt_content(content):
+    """Парсит TXT файл с данными"""
+    data = []
+    errors = []
+
+    lines = content.strip().split('\n')
+    for i, line in enumerate(lines, start=1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        try:
+            # Парсим строку вида: ID ЮЗЕРНЕЙМ УРОВЕНЬ "ПРИЧИНА" "ДОКАЗАТЕЛЬСТВА"
+            # Находим части в кавычках
+            parts = []
+            current = ""
+            in_quotes = False
+
+            for char in line:
+                if char == '"':
+                    in_quotes = not in_quotes
+                elif char == ' ' and not in_quotes:
+                    if current:
+                        parts.append(current)
+                        current = ""
+                else:
+                    current += char
+
+            if current:
+                parts.append(current)
+
+            # Должно быть минимум 3 части (ID, username, level)
+            if len(parts) < 3:
+                errors.append(f"Строка {i}: Недостаточно данных")
+                continue
+
+            user_id = parts[0].strip()
+            username = parts[1].strip() if len(parts) > 1 else ""
+            threat_level = parts[2].strip() if len(parts) > 2 else "3"
+            reason = parts[3].strip() if len(parts) > 3 else "Не указана"
+            proof = parts[4].strip() if len(parts) > 4 else "Не предоставлены"
+
+            # Заменяем - на пустую строку для username
+            if username == "-" or username.lower() == "нет":
+                username = ""
+
+            # Валидация
+            if not user_id.isdigit():
+                errors.append(f"Строка {i}: user_id должен содержать только цифры")
+                continue
+
+            try:
+                threat_level_int = int(threat_level)
+                if threat_level_int not in [1, 2, 3]:
+                    errors.append(f"Строка {i}: threat_level должен быть 1, 2 или 3")
+                    continue
+            except ValueError:
+                errors.append(f"Строка {i}: threat_level должен быть числом")
+                continue
+
+            # Очищаем username от @
+            username = username.replace('@', '')
+
+            data.append({
+                'user_id': user_id,
+                'username': username,
+                'threat_level': threat_level_int,
+                'reason': reason,
+                'proof': proof
+            })
+
+        except Exception as e:
+            errors.append(f"Строка {i}: Ошибка обработки - {str(e)}")
+            continue
+
+    return data, errors
+
+
+def parse_csv_content(content):
+    """Парсит CSV файл с данными"""
+    data = []
+    errors = []
+
+    # Пробуем разные разделители
+    for delimiter in (',', ';', '\t'):
+        try:
+            reader = csv.reader(io.StringIO(content), delimiter=delimiter)
+            rows = list(reader)
+
+            if rows and len(rows[0]) >= 3:  # Проверяем первую строку
+                # Пропускаем заголовок если он есть
+                start_index = 0
+                first_row = rows[0]
+                # Если первая строка содержит не цифры в первом столбце, это заголовок
+                if not first_row[0].replace('-', '').isdigit():
+                    start_index = 1
+
+                for i, row in enumerate(rows[start_index:], start=start_index + 1):
+                    try:
+                        if len(row) < 3:
+                            errors.append(f"Строка {i}: Мало данных")
+                            continue
+
+                        user_id = str(row[0]).strip()
+                        username = str(row[1]).strip() if len(row) > 1 else ""
+                        threat_level = str(row[2]).strip() if len(row) > 2 else "3"
+                        reason = str(row[3]).strip() if len(row) > 3 else "Не указана"
+                        proof = str(row[4]).strip() if len(row) > 4 else "Не предоставлены"
+
+                        # Заменяем - на пустую строку
+                        if username == "-" or username.lower() in ["нет", "no", "skip"]:
+                            username = ""
+
+                        # Валидация
+                        if not user_id.isdigit():
+                            errors.append(f"Строка {i}: user_id должен содержать только цифры")
+                            continue
+
+                        try:
+                            threat_level_int = int(threat_level)
+                            if threat_level_int not in [1, 2, 3]:
+                                errors.append(f"Строка {i}: threat_level должен быть 1, 2 или 3")
+                                continue
+                        except ValueError:
+                            errors.append(f"Строка {i}: threat_level должен быть числом")
+                            continue
+
+                        username = username.replace('@', '')
+
+                        data.append({
+                            'user_id': user_id,
+                            'username': username,
+                            'threat_level': threat_level_int,
+                            'reason': reason,
+                            'proof': proof
+                        })
+
+                    except Exception as e:
+                        errors.append(f"Строка {i}: Ошибка обработки - {str(e)}")
+                        continue
+
+                break  # Если удалось распарсить, выходим
+
+        except:
+            continue
+
+    return data, errors
+
+
+@router.message(BatchAddScammers.waiting_for_file)
+async def process_batch_file(message: Message, state: FSMContext):
+    """Обработчик файла для массовой загрузки"""
+    if message.text and message.text.lower() == 'отмена':
+        await state.clear()
+        await message.answer("❌ Массовая загрузка отменена.", reply_markup=get_admin_keyboard())
+        return
+
+    if not message.document:
+        await message.answer("❌ Пожалуйста, отправьте файл (CSV или TXT) или напишите 'отмена'.")
+        return
+
+    # Проверяем формат файла
+    file_name = message.document.file_name.lower()
+    if not (file_name.endswith('.csv') or file_name.endswith('.txt')):
+        await message.answer("❌ Файл должен быть в формате CSV (.csv) или TXT (.txt)")
+        return
+
+    try:
+        # Скачиваем файл
+        file = await message.bot.download(message.document.file_id)
+        content = file.read().decode('utf-8-sig').strip()
+
+        if not content:
+            await message.answer("❌ Файл пустой.")
+            return
+
+        # Определяем формат и парсим
+        valid_data = []
+        errors = []
+
+        if file_name.endswith('.txt'):
+            valid_data, errors = parse_txt_content(content)
+        else:  # CSV
+            valid_data, errors = parse_csv_content(content)
+
+        if not valid_data:
+            await message.answer(
+                "❌ Не найдено валидных данных для импорта.\n"
+                f"Ошибки:\n" + "\n".join(errors[:10]),
+                parse_mode="HTML"
+            )
+            return
+
+        # Сохраняем данные в состоянии
+        await state.update_data(
+            batch_data=valid_data,
+            batch_errors=errors,
+            batch_file_name=message.document.file_name
+        )
+
+        # Показываем предпросмотр
+        preview_text = (
+            f"📊 <b>Предпросмотр импорта</b>\n\n"
+            f"📁 Файл: <code>{message.document.file_name}</code>\n"
+            f"📈 Найдено записей: {len(valid_data)}\n"
+            f"❌ Ошибок: {len(errors)}\n\n"
+            f"<b>Первые 5 записей:</b>\n"
+        )
+
+        for i, data in enumerate(valid_data[:5], 1):
+            level_info = THREAT_LEVELS.get(data['threat_level'], THREAT_LEVELS[3])
+            username_display = f"@{data['username']}" if data['username'] else "не указан"
+            preview_text += (
+                f"{i}. {level_info['emoji']} <code>{data['user_id']}</code> "
+                f"({username_display})\n"
+            )
+
+        if len(valid_data) > 5:
+            preview_text += f"\n<i>... и еще {len(valid_data) - 5} записей</i>"
+
+        if errors:
+            preview_text += f"\n\n<b>Ошибки ({min(len(errors), 3)} из {len(errors)}):</b>\n"
+            for error in errors[:3]:
+                preview_text += f"• {error}\n"
+            if len(errors) > 3:
+                preview_text += f"<i>... и еще {len(errors) - 3} ошибок</i>"
+
+        preview_text += (
+            f"\n\n<b>Продолжить импорт?</b>\n"
+            f"Будут добавлены {len(valid_data)} записей."
+        )
+
+        await message.answer(preview_text, parse_mode="HTML", reply_markup=get_confirm_keyboard())
+        await state.set_state(BatchAddScammers.waiting_for_confirmation)
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при обработке файла: {str(e)}")
+        await state.clear()
+
+
+@router.callback_query(BatchAddScammers.waiting_for_confirmation, lambda c: c.data == "confirm_yes")
+async def process_batch_confirm_yes(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    user_data = await state.get_data()
+    batch_data = user_data.get('batch_data', [])
+    errors = user_data.get('batch_errors', [])
+    file_name = user_data.get('batch_file_name', 'файл.csv')
+
+    if not batch_data:
+        await callback.message.edit_text("❌ Нет данных для импорта.")
+        await state.clear()
+        return
+
+    # Импортируем данные
+    added_count = 0
+    skipped_count = 0
+    error_count = 0
+
+    progress_msg = await callback.message.answer(
+        f"🔄 <b>Начинаю импорт...</b>\n"
+        f"⏳ Обработано: 0/{len(batch_data)}",
+        parse_mode="HTML"
+    )
+
+    for i, data in enumerate(batch_data, 1):
+        try:
+            # Логируем перед добавлением
+            logger.info(
+                f"📥 Импортируем запись {i}/{len(batch_data)}: ID={data['user_id']}, username='{data['username']}'")
+
+            # Проверяем, существует ли уже пользователь
+            existing_user, _ = db.find_user(data['user_id'])
+
+            # Также проверяем по username если он есть
+            if not existing_user and data['username']:
+                existing_user, _ = db.find_user(data['username'])
+
+            if existing_user:
+                skipped_count += 1
+                logger.info(f"⏭️ Пропущено (уже в базе): ID={data['user_id']}")
+            else:
+                # Добавляем пользователя
+                success = db.add_scammer(
+                    user_id=data['user_id'],
+                    username=data['username'],
+                    threat_level=data['threat_level'],
+                    reason=data['reason'],
+                    proof=data['proof'],
+                    files_json='[]',
+                    added_by=callback.from_user.id
+                )
+
+                if success:
+                    added_count += 1
+                    db.log_admin_action(callback.from_user.id, "batch_add", data['user_id'])
+                    logger.info(f"✅ Успешно добавлено: ID={data['user_id']}")
+
+                    # Сразу проверяем что запись добавилась
+                    check_user, _ = db.find_user(data['user_id'])
+                    if check_user:
+                        logger.info(f"✅ Проверка: запись {data['user_id']} найдена в базе после добавления")
+                    else:
+                        logger.error(f"❌ ОШИБКА: запись {data['user_id']} не найдена в базе после добавления!")
+                else:
+                    error_count += 1
+                    logger.error(f"❌ Ошибка при добавлении: ID={data['user_id']}")
+
+            # Обновляем прогресс каждые 10 записей
+            if i % 10 == 0 or i == len(batch_data):
+                await progress_msg.edit_text(
+                    f"🔄 <b>Идет импорт...</b>\n"
+                    f"⏳ Обработано: {i}/{len(batch_data)}\n"
+                    f"✅ Добавлено: {added_count}\n"
+                    f"⏭️ Пропущено: {skipped_count}\n"
+                    f"❌ Ошибок: {error_count}",
+                    parse_mode="HTML"
+                )
+
+        except Exception as e:
+            error_count += 1
+            errors.append(f"Ошибка при импорте {data['user_id']}: {str(e)}")
+            logger.error(f"❌ Ошибка при импорте записи {data['user_id']}: {e}")
+            continue
+
+    # Проверяем итоговое состояние базы
+    all_records = db.get_all_scammers()
+    logger.info(f"📊 После импорта в базе: {len(all_records)} записей")
+
+    # Проверяем добавленные записи
+    for data in batch_data[:min(10, len(batch_data))]:
+        check_result, _ = db.find_user(data['user_id'])
+        if check_result:
+            logger.info(f"✅ Проверка поиска: ID={data['user_id']} -> НАЙДЕН (username: {check_result[1]})")
+        else:
+            logger.error(f"❌ Проверка поиска: ID={data['user_id']} -> НЕ НАЙДЕН!")
+
+    # Итоговое сообщение
+    result_text = (
+        f"📊 <b>Результаты импорта из {file_name}</b>\n\n"
+        f"📈 Всего записей в файле: {len(batch_data) + len(errors)}\n"
+        f"✅ Успешно добавлено: <b>{added_count}</b>\n"
+        f"⏭️ Пропущено (уже в базе): <b>{skipped_count}</b>\n"
+        f"❌ Ошибок при импорте: <b>{error_count}</b>\n"
+        f"⚠️ Ошибок валидации: <b>{len(errors)}</b>\n\n"
+    )
+
+    if errors:
+        result_text += f"<b>Примеры ошибок:</b>\n"
+        for error in errors[:5]:
+            result_text += f"• {error}\n"
+        if len(errors) > 5:
+            result_text += f"<i>... и еще {len(errors) - 5} ошибок</i>\n"
+
+    # Обновляем статистику в сообщении
+    await progress_msg.edit_text(result_text, parse_mode="HTML")
+
+    # Отправляем кнопки
+    await callback.message.answer("Что дальше?", reply_markup=get_admin_keyboard())
+
+    await state.clear()
+
+
+@router.callback_query(BatchAddScammers.waiting_for_confirmation, lambda c: c.data == "confirm_no")
+async def process_batch_confirm_no(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_text("❌ Импорт отменен.")
+    await state.clear()
+    await callback.message.answer("Что дальше?", reply_markup=get_admin_keyboard())
+
+
+@router.message(Command("delete"))
+async def cmd_delete(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.", reply_markup=get_main_keyboard())
+        return
+
+    await message.answer(
+        "🗑️ <b>Удаление записи</b>\n\n"
+        "Введите ID пользователя для удаления:",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(DeleteScammer.waiting_for_user_id)
+
+
+@router.message(Command("add"))
+async def cmd_add(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.", reply_markup=get_main_keyboard())
+        return
+
+    await state.clear()
+    await state.update_data(files=[])
+    await message.answer(
+        "📝 <b>Добавление новой записи</b>\n\n"
+        "<b>ШАГ 1:</b> Введите <b>ID пользователя</b> (только цифры):\n"
+        "<i>Пример: 123456789</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(AddScammer.waiting_for_user_id)
+
+
+@router.message(Command("check"))
+async def cmd_check(message: Message):
+    await message.answer(
+        "Отправьте <b>ID</b> или <b>@username</b> пользователя для проверки:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    all_scammers = db.get_all_scammers()
+    total = len(all_scammers)
+
+    verified = len([s for s in all_scammers if s[2] == 1])
+    suspicious = len([s for s in all_scammers if s[2] == 2])
+    scammers = len([s for s in all_scammers if s[2] == 3])
+
+    stats_text = (
+        f"📊 <b>Статистика базы {PROJECT_NAME}</b>\n\n"
+        f"• 📁 Всего записей: <b>{total}</b>\n"
+        f"• ✅ Проверенных: <b>{verified}</b>\n"
+        f"• ⚠️ Под подозрением: <b>{suspicious}</b>\n"
+        f"• 🚨 Мошенников: <b>{scammers}</b>\n\n"
+        f"<i>Данные обновляются в реальном времени</i>"
+    )
+
+    await message.answer(stats_text, parse_mode="HTML")
+
+
+# ============ ОБРАБОТКА УДАЛЕНИЯ ============
+@router.message(DeleteScammer.waiting_for_user_id)
+async def process_delete_id(message: Message, state: FSMContext):
+    if message.text.lower() == 'отмена':
+        await state.clear()
+        await message.answer("❌ Удаление отменено.", reply_markup=get_admin_keyboard())
+        return
+
+    user_id = message.text.strip().replace('@', '')
+
+    if not user_id.isdigit():
+        await message.answer("❌ ID должен содержать только цифры. Попробуйте еще раз или напишите 'отмена':")
+        return
+
+    # Проверяем, существует ли запись
+    user_data, _ = db.find_user(user_id)
+    if not user_data:
+        await message.answer(f"❌ Запись с ID <code>{user_id}</code> не найдена.", parse_mode="HTML")
+        await state.clear()
+        await message.answer("Что дальше?", reply_markup=get_admin_keyboard())
+        return
+
+    # Показываем информацию о пользователе и запрашиваем подтверждение
+    response, _ = format_user_info(user_data)
+    await message.answer(
+        f"⚠️ <b>Вы действительно хотите удалить эту запись?</b>\n\n{response}",
+        parse_mode="HTML",
+        reply_markup=get_delete_keyboard(user_id)
+    )
+    await state.clear()
+
+
+@router.callback_query(lambda c: c.data.startswith("delete_confirm_"))
+async def process_delete_confirm(callback: CallbackQuery):
+    user_id = callback.data.replace("delete_confirm_", "")
+
+    # Удаляем запись
+    success = db.delete_scammer(user_id)
+
+    if success:
+        await callback.message.edit_text(
+            f"✅ Запись с ID <code>{user_id}</code> успешно удалена!",
+            parse_mode="HTML"
+        )
+        db.log_admin_action(callback.from_user.id, "delete", user_id)
+    else:
+        await callback.message.edit_text(
+            f"❌ Ошибка при удаления записи с ID <code>{user_id}</code>",
+            parse_mode="HTML"
+        )
+
+    await callback.answer()
+    await callback.message.answer("Что дальше?", reply_markup=get_admin_keyboard())
+
+
+@router.callback_query(lambda c: c.data.startswith("delete_cancel_"))
+async def process_delete_cancel(callback: CallbackQuery):
+    user_id = callback.data.replace("delete_cancel_", "")
+    await callback.message.edit_text(
+        f"❌ Удаление записи с ID <code>{user_id}</code> отменено.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+    await callback.message.answer("Что дальше?", reply_markup=get_admin_keyboard())
+
+
+# ============ КНОПКИ ============
+@router.message(lambda m: m.text == "🔍 Проверить пользователя")
+async def button_check(message: Message):
+    await message.answer(
+        "Отправьте <b>ID</b> или <b>@username</b> пользователя для проверки:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+@router.message(lambda m: m.text == "❓ Справка")
+async def button_help(message: Message):
+    await cmd_help(message)
+
+
+@router.message(lambda m: m.text == "📊 Статистика базы")
+async def button_stats(message: Message):
+    all_scammers = db.get_all_scammers()
+    total = len(all_scammers)
+
+    verified = len([s for s in all_scammers if s[2] == 1])
+    suspicious = len([s for s in all_scammers if s[2] == 2])
+    scammers = len([s for s in all_scammers if s[2] == 3])
+
+    stats_text = (
+        f"📊 <b>Статистика базы {PROJECT_NAME}</b>\n\n"
+        f"• 📁 Всего записей: <b>{total}</b>\n"
+        f"• ✅ Проверенных: <b>{verified}</b>\n"
+        f"• ⚠️ Под подозрением: <b>{suspicious}</b>\n"
+        f"• 🚨 Мошенников: <b>{scammers}</b>\n\n"
+        f"<i>Данные обновляются в реальном времени</i>"
+    )
+
+    await message.answer(stats_text, parse_mode="HTML")
+
+
+@router.message(lambda m: m.text == "📋 Все записи")
+async def button_list(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен.", reply_markup=get_main_keyboard())
+        return
+
+    all_scammers = db.get_all_scammers()
+
+    if not all_scammers:
+        await message.answer("📭 База данных пуста.")
+        return
+
+    response = f"📋 <b>Записи в базе {PROJECT_NAME}:</b>\n\n"
+    for i, scammer in enumerate(all_scammers[:15], 1):
+        user_id, username, threat_level, reason, added_date = scammer
+        level_info = THREAT_LEVELS.get(threat_level, THREAT_LEVELS[3])
+        date_short = added_date.split()[0] if added_date else "???"
+        username_display = f"@{username}" if username else "нет"
+        response += f"{i}. {level_info['emoji']} <code>{user_id}</code> ({username_display}) - {date_short}\n"
+
+    response += f"\n<i>Всего записей: {len(all_scammers)}</i>"
+    await message.answer(response, parse_mode="HTML")
+
+
+@router.message(lambda m: m.text == "➕ Добавить запись")
+async def button_add(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.", reply_markup=get_main_keyboard())
+        return
+
+    await state.clear()
+    await state.update_data(files=[])
+    await message.answer(
+        "📝 <b>Добавление новой записи</b>\n\n"
+        "<b>ШАГ 1:</b> Введите <b>ID пользователя</b> (только цифры):\n"
+        "<i>Пример: 123456789</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(AddScammer.waiting_for_user_id)
+
+
+@router.message(lambda m: m.text == "🗑️ Удалить запись")
+async def button_delete(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.", reply_markup=get_main_keyboard())
+        return
+
+    await state.clear()
+    await cmd_delete(message, state)
+
+
+@router.message(lambda m: m.text == "📁 Массовая загрузка")
+async def button_batch_add(message: Message, state: FSMContext):
+    await cmd_batch_add(message, state)
+
+
+# ============ ДОБАВЛЕНИЕ ЗАПИСИ ============
+@router.message(AddScammer.waiting_for_user_id)
+async def process_user_id(message: Message, state: FSMContext):
+    user_input = message.text.strip().replace('@', '')
+
+    if not user_input.isdigit():
+        await message.answer("❌ ID должен содержать только цифры. Попробуйте еще раз:")
+        return
+
+    # Проверяем, есть ли уже такой пользователь в базе
+    existing_user, _ = db.find_user(user_input)
+    if existing_user:
+        response, files = format_user_info(existing_user)
+        await message.answer(
+            f"⚠️ <b>Пользователь уже есть в базе!</b>\n\n{response}",
+            parse_mode="HTML"
+        )
+
+        await message.answer(
+            "Что вы хотите сделать?\n"
+            "• Напишите 'отмена' чтобы выйти\n"
+            "• Напишите 'новый' чтобы ввести другой ID",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+
+    await state.update_data(user_id=user_input)
+
+    await message.answer(
+        f"✅ ID <code>{user_input}</code> принят!\n\n"
+        "<b>ШАГ 2:</b> Введите <b>юзернейм</b> (без @) или 'пропустить':",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddScammer.waiting_for_username)
+
+
+@router.message(AddScammer.waiting_for_username)
+async def process_username(message: Message, state: FSMContext):
+    # Обработка отмены или выбора
+    text_lower = message.text.lower()
+    if text_lower == 'отмена':
+        await state.clear()
+        await message.answer("❌ Добавление отменено.", reply_markup=get_admin_keyboard())
+        return
+    elif text_lower == 'новый':
+        await message.answer(
+            "Введите <b>ID пользователя</b> (только цифры):",
+            parse_mode="HTML"
+        )
+        await state.set_state(AddScammer.waiting_for_user_id)
+        return
+
+    username = message.text.strip().replace('@', '')
+
+    if username.lower() in ['пропустить', 'skip', 'нет', 'no', '-']:
+        username = ""
+
+    await state.update_data(username=username)
+
+    username_display = f"@{username}" if username else "не указан"
+    await message.answer(
+        f"✅ Юзернейм {username_display}!\n\n"
+        "<b>ШАГ 3:</b> Введите <b>причину</b> внесения:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddScammer.waiting_for_reason)
+
+
+@router.message(AddScammer.waiting_for_reason)
+async def process_reason(message: Message, state: FSMContext):
+    reason = message.text.strip()
+
+    if len(reason) < 5:
+        await message.answer("❌ Слишком коротко. Напишите подробнее:")
+        return
+
+    await state.update_data(reason=reason)
+
+    await message.answer(
+        "✅ Причина сохранена!\n\n"
+        "<b>ШАГ 4:</b> Введите <b>текстовые доказательства</b> или 'нет':",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddScammer.waiting_for_proof)
+
+
+@router.message(AddScammer.waiting_for_proof)
+async def process_proof(message: Message, state: FSMContext):
+    proof = message.text.strip()
+
+    if proof.lower() in ['нет', 'no', 'н', '-']:
+        proof = "Текстовые доказательства не предоставлены"
+
+    await state.update_data(proof=proof)
+
+    await message.answer(
+        "✅ Доказательства сохранены!\n\n"
+        "<b>ШАГ 5:</b> Прикрепите файлы (фото/видео) или напишите 'готово':",
+        parse_mode="HTML"
+    )
+    await state.set_state(AddScammer.waiting_for_files)
+
+
+@router.message(AddScammer.waiting_for_files)
+async def process_files(message: Message, state: FSMContext):
+    # Проверяем, если это текст "готово" или "пропустить" (в любом регистре)
+    if message.text:
+        text_lower = message.text.lower()
+        if text_lower in ['готово', 'пропустить', 'skip', 'done', 'готова', 'готов']:
+            # Получаем текущие данные из состояния
+            user_data = await state.get_data()
+            files = user_data.get('files', [])
+
+            # Сохраняем файлы в формате JSON
+            files_json = json.dumps(files)
+            await state.update_data(files_json=files_json)
+
+            await message.answer(
+                "🎯 <b>ШАГ 6:</b> Выберите <b>уровень угрозы</b>:",
+                reply_markup=get_threat_level_keyboard(),
+                parse_mode="HTML"
+            )
+            await state.set_state(AddScammer.waiting_for_threat_level)
+            return
+
+    # Проверяем, если это файл (фото, видео или документ)
+    if message.photo or message.video or message.document:
+        # Получаем текущие файлы из состояния
+        user_data = await state.get_data()
+        files = user_data.get('files', [])
+
+        # Определяем тип файла и получаем file_id
+        file_data = {}
+
+        if message.photo:
+            file_data = {
+                'file_id': message.photo[-1].file_id,
+                'file_type': 'photo',
+                'caption': message.caption or ''
+            }
+        elif message.video:
+            file_data = {
+                'file_id': message.video.file_id,
+                'file_type': 'video',
+                'caption': message.caption or ''
+            }
+        elif message.document:
+            file_data = {
+                'file_id': message.document.file_id,
+                'file_type': 'document',
+                'caption': message.caption or ''
+            }
+
+        # Добавляем файл в список
+        files.append(file_data)
+        await state.update_data(files=files)
+
+        await message.answer(
+            f"✅ Файл добавлен! Всего файлов: {len(files)}\n"
+            f"Отправьте еще файлы или напишите 'готово' чтобы продолжить."
+        )
+        return
+
+    # Если это не файл и не "готово" - просим отправить файл или написать "готово"
+    await message.answer(
+        "Пожалуйста, отправьте файл (фото/видео/документ) или напишите 'готово' чтобы продолжить."
+    )
+
+
+@router.callback_query(lambda c: c.data.startswith("threat_"))
+async def process_threat_level(callback: CallbackQuery, state: FSMContext):
+    threat_level = int(callback.data.split("_")[1])
+    user_data = await state.get_data()
+    level_info = THREAT_LEVELS[threat_level]
+
+    # Получаем файлы в формате JSON
+    files_json = user_data.get('files_json', '[]')
+
+    success = db.add_scammer(
+        user_id=user_data['user_id'],
+        username=user_data.get('username', ''),
+        threat_level=threat_level,
+        reason=user_data['reason'],
+        proof=user_data['proof'],
+        files_json=files_json,
+        added_by=callback.from_user.id
+    )
+
+    if success:
+        username_display = f"@{user_data.get('username')}" if user_data.get('username') else "не указан"
+        files_list = json.loads(files_json)
+
+        await callback.message.edit_text(
+            f"✅ <b>ЗАПИСЬ ДОБАВЛЕНА!</b>\n\n"
+            f"👤 <b>ID:</b> <code>{user_data['user_id']}</code>\n"
+            f"📛 <b>Юзернейм:</b> {username_display}\n"
+            f"🚨 <b>Уровень:</b> {level_info['name']}\n"
+            f"📎 <b>Файлов прикреплено:</b> {len(files_list)}\n"
+            f"📅 <b>Дата:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+            parse_mode="HTML"
+        )
+        db.log_admin_action(callback.from_user.id, "add", user_data['user_id'])
+
+        # Проверяем что запись действительно добавлена
+        check_result, _ = db.find_user(user_data['user_id'])
+        if check_result:
+            logger.info(f"✅ Проверка: запись {user_data['user_id']} успешно добавлена и найдена в базе")
+        else:
+            logger.error(f"❌ ОШИБКА: запись {user_data['user_id']} не найдена в базе после добавления!")
+
+        await callback.message.answer("Что дальше?", reply_markup=get_admin_keyboard())
+    else:
+        await callback.message.edit_text("❌ Ошибка при сохранении", parse_mode="HTML")
+
+    await state.clear()
+    await callback.answer()
+
+
+# ============ ПОИСК ПОЛЬЗОВАТЕЛЯ ============
+async def send_files(bot, chat_id, files):
+    """Отправляет файлы пользователю"""
+    try:
+        for file_data in files:
+            file_id = file_data.get('file_id')
+            file_type = file_data.get('file_type')
+            caption = file_data.get('caption', '')[:1024]
+
+            if file_type == 'photo':
+                await bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption)
+            elif file_type == 'video':
+                await bot.send_video(chat_id=chat_id, video=file_id, caption=caption)
+            elif file_type == 'document':
+                await bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
+            else:
+                await bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке файлов: {e}")
+        await bot.send_message(chat_id, f"⚠️ Не удалось отправить некоторые файлы: {str(e)}")
+
+
+# Обработчик для поиска (только когда не в состоянии)
+@router.message(StateFilter(default_state))
+async def process_search(message: Message):
+    """Обрабатывает поиск ТОЛЬКО когда пользователь НЕ в состоянии FSM"""
+
+    # Пропускаем если это команда
+    if message.text and message.text.startswith('/'):
+        return
+
+    # Пропускаем кнопки меню
+    if message.text in ["🔍 Проверить пользователя", "❓ Справка", "📊 Статистика базы",
+                        "📋 Все записи", "➕ Добавить запись", "🗑️ Удалить запись", "📁 Массовая загрузка"]:
+        return
+
+    user_input = message.text.strip()
+    if not user_input:
+        return
+
+    logger.info(f"🔍 Пользователь ищет: '{user_input}'")
+
+    # Ищем пользователя
+    user_data, found_by = db.find_user(user_input)
+
+    if not user_data:
+        response = f"🔍 <b>Поиск:</b> <code>{user_input}</code>\n\n❌ Не найден в базе.\n✅ Статус: чистый"
+        keyboard = get_admin_keyboard() if is_admin(message.from_user.id) else get_main_keyboard()
+        await message.answer(response, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    response, files = format_user_info(user_data)
+    keyboard = get_admin_keyboard() if is_admin(message.from_user.id) else get_main_keyboard()
+
+    found_text = "ID" if found_by == 'id' else "юзернейму"
+    search_info = f"🔍 <b>Найдено по {found_text}:</b> <code>{user_input}</code>\n\n"
+    response = search_info + response
+
+    # Отправляем текстовую информацию
+    await message.answer(response, parse_mode="HTML", reply_markup=keyboard)
+
+    # Если есть файлы - отправляем их
+    if files:
+        await send_files(message.bot, message.chat.id, files)

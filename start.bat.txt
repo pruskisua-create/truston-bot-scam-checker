@@ -1,0 +1,6 @@
+@echo off
+echo Установка зависимостей...
+pip install aiogram
+echo Запуск бота...
+python main.py
+pause
