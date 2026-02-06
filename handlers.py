@@ -2,8 +2,10 @@ import json
 import csv
 import io
 import re
+import tempfile
+import os
 from datetime import datetime
-from aiogram import Router
+from aiogram import Router, types
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove, ContentType
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -64,6 +66,7 @@ async def cmd_help(message: Message):
         f"• /batch_add - Массовая загрузка из файла (админы)\n"
         f"• /delete - Удалить запись (админы)\n"
         f"• /stats - Статистика\n"
+        f"• /backup - Создать резервную копию (админы)\n"
         f"• /help - Справка\n\n"
         f"<b>Форматы файлов для массовой загрузки:</b>\n"
         f"• CSV: user_id,username,threat_level,reason,proof\n"
@@ -75,6 +78,75 @@ async def cmd_help(message: Message):
     await message.answer(help_text, parse_mode="HTML")
 
 
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    """Создание резервной копии базы данных"""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа.", reply_markup=get_main_keyboard())
+        return
+
+    # Получаем все записи из базы
+    all_scammers = db.get_all_scammers()
+
+    if not all_scammers:
+        await message.answer("📭 База данных пуста. Нечего сохранять.")
+        return
+
+    await message.answer("🔄 Создаю резервную копию...")
+
+    try:
+        # Создаем структуру для бэкапа
+        backup_data = []
+        total_records = len(all_scammers)
+        processed = 0
+
+        for user_id, username, threat_level, reason, added_date in all_scammers:
+            # Получаем полные данные пользователя
+            user_data, _ = db.find_user(user_id)
+            if user_data:
+                backup_data.append({
+                    'user_id': user_data[0],
+                    'username': user_data[1] or '',
+                    'threat_level': user_data[2],
+                    'reason': user_data[3] or 'Не указана',
+                    'proof': user_data[4] or 'Не предоставлены',
+                    'added_date': added_date or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+
+            processed += 1
+            if processed % 10 == 0:  # Обновляем прогресс каждые 10 записей
+                await message.edit_text(f"🔄 Обработано {processed}/{total_records} записей...")
+
+        # Создаем временный файл
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
+            json.dump(backup_data, f, ensure_ascii=False, indent=2)
+            temp_file = f.name
+
+        # Отправляем файл пользователю
+        with open(temp_file, 'rb') as f:
+            backup_bytes = f.read()
+
+        # Создаем имя файла с датой
+        backup_filename = f"truston_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        await message.answer_document(
+            document=types.BufferedInputFile(backup_bytes, filename=backup_filename),
+            caption=f"📦 <b>Резервная копия базы {PROJECT_NAME}</b>\n\n"
+                    f"📊 Записей: {len(backup_data)}\n"
+                    f"📅 Дата создания: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+                    f"<i>Для восстановления используйте команду /batch_add и отправьте этот файл</i>",
+            parse_mode="HTML"
+        )
+
+        # Удаляем временный файл
+        os.unlink(temp_file)
+
+        await message.answer(f"✅ Резервная копия создана успешно! Сохранено {len(backup_data)} записей.")
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при создании резервной копии: {str(e)}")
+
+
 @router.message(Command("batch_add"))
 async def cmd_batch_add(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -83,11 +155,12 @@ async def cmd_batch_add(message: Message, state: FSMContext):
 
     await message.answer(
         "📁 <b>Массовая загрузка записей из файла</b>\n\n"
-        "Отправьте мне файл в формате CSV или TXT\n\n"
+        "Отправьте мне файл в формате CSV, TXT или JSON (бэкап)\n\n"
         "<b>Формат CSV:</b>\n"
         "<code>user_id,username,threat_level,reason,proof</code>\n\n"
         "<b>Формат TXT:</b>\n"
         "<code>123456789 scammer1 3 \"Обманул на 1000$\" \"скрины\"</code>\n\n"
+        "<b>Формат JSON:</b> файл созданный командой /backup\n\n"
         "<b>Примечания:</b>\n"
         "• threat_level: 1✅, 2⚠️, 3🚨\n"
         "• username можно оставить пустым (используйте -)\n"
@@ -247,6 +320,68 @@ def parse_csv_content(content):
     return data, errors
 
 
+def parse_json_content(content):
+    """Парсит JSON файл (бэкап)"""
+    data = []
+    errors = []
+
+    try:
+        backup_data = json.loads(content)
+
+        if not isinstance(backup_data, list):
+            errors.append("JSON должен содержать массив записей")
+            return data, errors
+
+        for i, item in enumerate(backup_data, 1):
+            try:
+                if not isinstance(item, dict):
+                    errors.append(f"Запись {i}: должна быть объектом")
+                    continue
+
+                # Получаем поля
+                user_id = str(item.get('user_id', '')).strip()
+                username = str(item.get('username', '')).strip()
+                threat_level = str(item.get('threat_level', '3')).strip()
+                reason = str(item.get('reason', 'Не указана')).strip()
+                proof = str(item.get('proof', 'Не предоставлены')).strip()
+
+                # Валидация
+                if not user_id or not user_id.isdigit():
+                    errors.append(f"Запись {i}: неверный user_id")
+                    continue
+
+                try:
+                    threat_level_int = int(threat_level)
+                    if threat_level_int not in [1, 2, 3]:
+                        errors.append(f"Запись {i}: threat_level должен быть 1, 2 или 3")
+                        continue
+                except ValueError:
+                    errors.append(f"Запись {i}: threat_level должен быть числом")
+                    continue
+
+                # Очищаем username от @
+                username = username.replace('@', '')
+
+                data.append({
+                    'user_id': user_id,
+                    'username': username,
+                    'threat_level': threat_level_int,
+                    'reason': reason,
+                    'proof': proof
+                })
+
+            except Exception as e:
+                errors.append(f"Запись {i}: ошибка обработки - {str(e)}")
+                continue
+
+    except json.JSONDecodeError as e:
+        errors.append(f"Ошибка разбора JSON: {str(e)}")
+    except Exception as e:
+        errors.append(f"Ошибка обработки файла: {str(e)}")
+
+    return data, errors
+
+
 @router.message(BatchAddScammers.waiting_for_file)
 async def process_batch_file(message: Message, state: FSMContext):
     if message.text and message.text.lower() == 'отмена':
@@ -255,13 +390,13 @@ async def process_batch_file(message: Message, state: FSMContext):
         return
 
     if not message.document:
-        await message.answer("❌ Пожалуйста, отправьте файл (CSV или TXT) или напишите 'отмена'.")
+        await message.answer("❌ Пожалуйста, отправьте файл (CSV, TXT или JSON) или напишите 'отмена'.")
         return
 
     # Проверяем формат файла
     file_name = message.document.file_name.lower()
-    if not (file_name.endswith('.csv') or file_name.endswith('.txt')):
-        await message.answer("❌ Файл должен быть в формате CSV (.csv) или TXT (.txt)")
+    if not (file_name.endswith('.csv') or file_name.endswith('.txt') or file_name.endswith('.json')):
+        await message.answer("❌ Файл должен быть в формате CSV (.csv), TXT (.txt) или JSON (.json)")
         return
 
     try:
@@ -279,8 +414,10 @@ async def process_batch_file(message: Message, state: FSMContext):
 
         if file_name.endswith('.txt'):
             valid_data, errors = parse_txt_content(content)
-        else:  # CSV
+        elif file_name.endswith('.csv'):
             valid_data, errors = parse_csv_content(content)
+        else:  # JSON
+            valid_data, errors = parse_json_content(content)
 
         if not valid_data:
             await message.answer(
